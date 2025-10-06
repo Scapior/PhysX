@@ -34,52 +34,138 @@
 // ****************************************************************************
 
 #include <ctype.h>
+
 #include "PxPhysicsAPI.h"
+
 #include "../snippetcommon/SnippetPrint.h"
 #include "../snippetcommon/SnippetPVD.h"
 #include "../snippetutils/SnippetUtils.h"
 
+#include "RagdollData.h"
+
 using namespace physx;
 
-static PxDefaultAllocator		gAllocator;
-static PxDefaultErrorCallback	gErrorCallback;
-static PxFoundation*			gFoundation = NULL;
-static PxPhysics*				gPhysics	= NULL;
-static PxDefaultCpuDispatcher*	gDispatcher = NULL;
-static PxScene*					gScene		= NULL;
-static PxMaterial*				gMaterial	= NULL;
-static PxPvd*					gPvd        = NULL;
+PxDefaultAllocator		gAllocator;
+PxDefaultErrorCallback	gErrorCallback;
 
-static PxReal stackZ = 10.0f;
+PxFoundation*			gFoundation = NULL;
+PxPhysics*				gPhysics	= NULL;
 
-static PxRigidDynamic* createDynamic(const PxTransform& t, const PxGeometry& geometry, const PxVec3& velocity=PxVec3(0))
+PxDefaultCpuDispatcher*	gDispatcher = NULL;
+PxScene*				gScene		= NULL;
+
+PxMaterial*				gMaterial	= NULL;
+
+PxPvd*                  gPvd        = NULL;
+
+
+PxRigidDynamic* gRagdollActors[Skeleton::count];
+
+
+const Skeleton::Enum createList[] =
+{
+	Skeleton::pelvis,
+
+	Skeleton::tail,
+	Skeleton::tail1,
+	Skeleton::tail2,
+
+	Skeleton::spine,
+	Skeleton::spine1,
+	Skeleton::head,
+
+	// uncommenting all shapes leads to the ragdoll flying off into space
+	//Skeleton::tail3
+};
+
+PxRigidDynamic* createRagdollActor(const PxTransform& actorGlobalPose, const PxU32 actorIndex) {
+	static const Skeleton::Enum* createListBegin = std::begin(createList);
+	static const Skeleton::Enum* createListEnd = std::end(createList);
+	if (std::find(createListBegin, createListEnd, actorIndex) == createListEnd)
+	{
+		return nullptr;
+	}
+
+
+	const Ragdoll::Geometry& ragdollGeometry = Ragdoll::geometry[actorIndex];
+	
+	physx::PxGeometryHolder geometryHolder = ragdollGeometry.geometry;
+	if (geometryHolder.getType() == physx::PxGeometryType::eCONVEXMESH)
+	{
+		const Ragdoll::ConvexDataArray& convex = *ragdollGeometry.convexPointer;
+
+		PxConvexMeshDesc convexMeshDesc;
+		convexMeshDesc.points.data = convex.data();
+		convexMeshDesc.points.count = static_cast<PxU32>(convex.size());
+		convexMeshDesc.points.stride = sizeof(PxVec3);
+		convexMeshDesc.flags = PxConvexFlag::eCOMPUTE_CONVEX;
+
+		geometryHolder.convexMesh().convexMesh = PxCreateConvexMesh(PxCookingParams(PxTolerancesScale()), convexMeshDesc, gPhysics->getPhysicsInsertionCallback());
+	}
+
+	
+	PxRigidDynamic* actor = gPhysics->createRigidDynamic(actorGlobalPose);
+	actor->setName(Skeleton::names[actorIndex]);
+	actor->setCMassLocalPose(Ragdoll::localMassCenters[actorIndex]);
+	PxRigidBodyExt::updateMassAndInertia(*actor, 1.0f);
+
+	//printf("Created actor %s\n", Skeleton::names[actorIndex]);
+
+	PxShape* shape = PxRigidActorExt::createExclusiveShape(*actor, geometryHolder.any(), *gMaterial); (void)shape;
+	shape->setName(Skeleton::names[actorIndex]);
+	shape->setLocalPose(Ragdoll::shapeLocalPose[actorIndex]);
+
+	gScene->addActor(*actor);
+
+	const Skeleton::Enum parentBone = Skeleton::parentBones[actorIndex];
+	if (parentBone != Skeleton::invalid && actorIndex != Skeleton::pelvis)
+	{
+		if (PxRigidDynamic* parentActor = gRagdollActors[parentBone])
+		{
+			PxTransform parentPose = Ragdoll::jointParentPoses[actorIndex];
+			parentPose.q.normalize();
+
+			PxSphericalJoint* joint = PxSphericalJointCreate(*gPhysics, parentActor, parentPose, actor, PxTransform(PxIdentity));
+			joint->setConstraintFlag(PxConstraintFlag::eCOLLISION_ENABLED, false);
+
+			//printf(" - Attached %s to %s\n", Skeleton::names[actorIndex], Skeleton::names[parentBone]);
+		}
+	}
+	
+
+	return actor;
+}
+
+void createRagdoll(const PxVec3 globalPose)
+{
+	for (PxU8 i_actor = 0; i_actor < Skeleton::count; ++i_actor)
+	{
+		PxTransform actorPose = Ragdoll::actorGlobalPoses[i_actor];
+		actorPose.p += globalPose;
+
+		gRagdollActors[i_actor] = createRagdollActor(actorPose, i_actor);
+	}
+}
+
+
+PxRigidDynamic* createDynamic(const PxTransform& t, const PxGeometry& geometry, const PxVec3& velocity=PxVec3(0))
 {
 	PxRigidDynamic* dynamic = PxCreateDynamic(*gPhysics, t, geometry, *gMaterial, 10.0f);
 	dynamic->setAngularDamping(0.5f);
 	dynamic->setLinearVelocity(velocity);
+	dynamic->setMass(2.0f);
 	gScene->addActor(*dynamic);
 	return dynamic;
 }
 
-static void createStack(const PxTransform& t, PxU32 size, PxReal halfExtent)
+void createStatic()
 {
-	PxShape* shape = gPhysics->createShape(PxBoxGeometry(halfExtent, halfExtent, halfExtent), *gMaterial);
-	for(PxU32 i=0; i<size;i++)
-	{
-		for(PxU32 j=0;j<size-i;j++)
-		{
-			PxTransform localTm(PxVec3(PxReal(j*2) - PxReal(size-i), PxReal(i*2+1), 0) * halfExtent);
-			PxRigidDynamic* body = gPhysics->createRigidDynamic(t.transform(localTm));
-			body->attachShape(*shape);
-			PxRigidBodyExt::updateMassAndInertia(*body, 10.0f);
-			gScene->addActor(*body);
-		}
-	}
-	shape->release();
+	PxRigidStatic* groundPlane = PxCreatePlane(*gPhysics, PxPlane(0,1,0,0), *gMaterial);
+	gScene->addActor(*groundPlane);
 }
 
-void initPhysics(bool interactive)
-{
+void initPhysics(bool /*interactive*/)
+{	
 	gFoundation = PxCreateFoundation(PX_PHYSICS_VERSION, gAllocator, gErrorCallback);
 
 	gPvd = PxCreatePvd(*gFoundation);
@@ -87,12 +173,14 @@ void initPhysics(bool interactive)
 	gPvd->connect(*transport,PxPvdInstrumentationFlag::eALL);
 
 	gPhysics = PxCreatePhysics(PX_PHYSICS_VERSION, *gFoundation, PxTolerancesScale(), true, gPvd);
+	PxInitExtensions(*gPhysics, gPvd);
 
 	PxSceneDesc sceneDesc(gPhysics->getTolerancesScale());
+	sceneDesc.solverType = PxSolverType::eTGS;
 	sceneDesc.gravity = PxVec3(0.0f, -9.81f, 0.0f);
-	gDispatcher = PxDefaultCpuDispatcherCreate(2);
-	sceneDesc.cpuDispatcher	= gDispatcher;
-	sceneDesc.filterShader	= PxDefaultSimulationFilterShader;
+	sceneDesc.cpuDispatcher = gDispatcher = PxDefaultCpuDispatcherCreate(2);
+	sceneDesc.filterShader = PxDefaultSimulationFilterShader;
+	
 	gScene = gPhysics->createScene(sceneDesc);
 
 	PxPvdSceneClient* pvdClient = gScene->getScenePvdClient();
@@ -102,16 +190,12 @@ void initPhysics(bool interactive)
 		pvdClient->setScenePvdFlag(PxPvdSceneFlag::eTRANSMIT_CONTACTS, true);
 		pvdClient->setScenePvdFlag(PxPvdSceneFlag::eTRANSMIT_SCENEQUERIES, true);
 	}
+
 	gMaterial = gPhysics->createMaterial(0.5f, 0.5f, 0.6f);
 
-	PxRigidStatic* groundPlane = PxCreatePlane(*gPhysics, PxPlane(0,1,0,0), *gMaterial);
-	gScene->addActor(*groundPlane);
+	createStatic();
 
-	for(PxU32 i=0;i<5;i++)
-		createStack(PxTransform(PxVec3(0,0,stackZ-=10.0f)), 10, 2.0f);
-
-	if(!interactive)
-		createDynamic(PxTransform(PxVec3(0,40,100)), PxSphereGeometry(10), PxVec3(0,-50,-100));
+	createRagdoll(PxVec3(0.0f, 1.f, 0.0f));
 }
 
 void stepPhysics(bool /*interactive*/)
@@ -128,20 +212,20 @@ void cleanupPhysics(bool /*interactive*/)
 	if(gPvd)
 	{
 		PxPvdTransport* transport = gPvd->getTransport();
-		PX_RELEASE(gPvd);
+		gPvd->release();	gPvd = NULL;
 		PX_RELEASE(transport);
 	}
 	PX_RELEASE(gFoundation);
 	
-	printf("SnippetHelloWorld done.\n");
+	//printf("SnippetHelloWorld done.\n");
 }
 
 void keyPress(unsigned char key, const PxTransform& camera)
 {
 	switch(toupper(key))
 	{
-	case 'B':	createStack(PxTransform(PxVec3(0,0,stackZ-=10.0f)), 10, 2.0f);						break;
-	case ' ':	createDynamic(camera, PxSphereGeometry(3.0f), camera.rotate(PxVec3(0,0,-1))*200);	break;
+	case 'C':	createRagdoll(PxVec3(0.0f, 1.0f, 0.0f));	break;
+	case ' ':	createDynamic(camera, PxSphereGeometry(0.4f), camera.rotate(PxVec3(0,0,-1))*40);	break;
 	}
 }
 

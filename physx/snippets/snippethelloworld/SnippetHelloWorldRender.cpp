@@ -72,7 +72,7 @@ void exitCallback()
 
 void renderLoop()
 {
-	sCamera = new Snippets::Camera(PxVec3(50.0f, 50.0f, 50.0f), PxVec3(-0.6f,-0.2f,-0.7f));
+	sCamera = new Snippets::Camera(PxVec3(2.0f, 2.0f, 2.0f), PxVec3(-0.6f,-0.2f,-0.7f));
 
 	Snippets::setupDefault("PhysX Snippet HelloWorld", sCamera, keyPress, renderCallback, exitCallback);
 
